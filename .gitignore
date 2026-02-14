@@ -1,0 +1,19 @@
+/docs/archive
+external_reference_skills/
+internal.md
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Foundry
+contracts/out/
+contracts/cache/
+contracts/lib/
+
+wallet_public_addresses.md
+.DS_Store
+scripts/tests.md
+skills/soulblock/node_modules/
+**/testing_notes*.md

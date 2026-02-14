@@ -1,0 +1,14 @@
+version: '3.8'
+services:
+  web:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - .:/app
+      - /app/node_modules
+    environment:
+      - NEXT_PUBLIC_CONTRACT_ADDRESS=${CONTRACT_ADDRESS}
+      - NEXT_PUBLIC_CHAIN_ID=${CHAIN_ID:-8453}
+      - NEXT_PUBLIC_RPC_URL=${RPC_URL:-https://mainnet.base.org}
+      - NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID=${WALLETCONNECT_PROJECT_ID}
