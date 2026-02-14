@@ -27,10 +27,18 @@ export const metadata: Metadata = {
     title: 'Soul Blocks',
     description: 'On-chain, append-only identity for agents',
     siteName: 'Soul Blocks',
+    images: [
+      {
+        url: 'https://soulblocks.ai/og-image.png',
+        width: 1200,
+        height: 630,
+      },
+    ],
   },
   twitter: {
-    card: 'summary',
+    card: 'summary_large_image',
     site: '@cryptoAIdev',
+    images: ['https://soulblocks.ai/og-image.png'],
   },
 };
 
