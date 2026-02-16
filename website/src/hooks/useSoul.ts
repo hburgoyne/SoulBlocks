@@ -102,8 +102,6 @@ interface FragmentsResult {
   totalCount: number | undefined;
 }
 
-const INITIAL_BATCH_SIZE = 5;
-
 // Module-level cache for loaded fragments keyed by tokenId
 const fragmentCache = new Map<number, { fragments: FragmentData[]; totalCount: number }>();
 
@@ -161,140 +159,47 @@ export function useFragments(tokenId: number, refetchKey?: number): FragmentsRes
         return;
       }
 
-      // Fetch FragmentAppended events for metadata (addresses + block numbers)
-      const eventMap = new Map<number, { fragmentAddress: string; appenderAddress: string; blockNumber: bigint }>();
-      let eventsFailed = false;
-      try {
-        const events = await getContractEvents(wagmiConfig, {
-          address: addr,
-          abi: SOULBLOCKS_ABI,
-          eventName: 'FragmentAppended',
-          args: { tokenId: BigInt(tid) },
-          fromBlock: 'earliest',
-          toBlock: 'latest',
-        });
+      if (loadIdRef.current !== loadId) return;
 
-        // Fetch transaction for each event to get the appender's wallet address
-        const publicClient = getPublicClient(wagmiConfig);
-        for (const event of events) {
-          const args = event.args as {
-            tokenId?: bigint;
-            fragment?: string;
-            byteLength?: bigint;
-            fragmentIndex?: bigint;
-          };
-          if (args.fragmentIndex !== undefined && args.fragment) {
-            let appenderAddress = '';
-            let resolvedBlockNumber = event.blockNumber ?? 0n;
-            if (publicClient && event.transactionHash) {
-              try {
-                const tx = await publicClient.getTransaction({ hash: event.transactionHash });
-                appenderAddress = tx.from;
-                // Use tx.blockNumber as fallback when event.blockNumber is null
-                if (resolvedBlockNumber === 0n && tx.blockNumber) {
-                  resolvedBlockNumber = tx.blockNumber;
-                }
-              } catch {
-                // Transaction fetch is best-effort
-              }
-            }
-            eventMap.set(Number(args.fragmentIndex), {
-              fragmentAddress: args.fragment,
-              appenderAddress,
-              blockNumber: resolvedBlockNumber,
-            });
-          }
-        }
-      } catch (err) {
-        // Event fetching failed — fall back to getFragmentAddress for metadata
-        console.warn('Failed to fetch FragmentAppended events, falling back to getFragmentAddress:', err);
-        eventsFailed = true;
-      }
+      // Load fragment content directly — avoid eth_getLogs (unreliable on public RPCs)
+      // and minimize RPC calls to stay under rate limits.
+      // Load fragments sequentially (one at a time) to avoid rate-limiting.
+      const allFragments: FragmentData[] = [];
+      let batchHasError = false;
 
-      // If events failed, fetch fragment addresses as fallback
-      if (eventsFailed) {
-        for (let i = 0; i < total; i++) {
-          try {
-            const fragmentAddr = await readContract(wagmiConfig, {
+      for (let i = 0; i < total; i++) {
+        if (loadIdRef.current !== loadId) return;
+
+        try {
+          // Fetch content and address in parallel for this fragment
+          const [content, fragmentAddr] = await Promise.all([
+            readContract(wagmiConfig, {
+              address: addr,
+              abi: SOULBLOCKS_ABI,
+              functionName: 'getFragmentContent',
+              args: [BigInt(tid), BigInt(i)],
+            }),
+            readContract(wagmiConfig, {
               address: addr,
               abi: SOULBLOCKS_ABI,
               functionName: 'getFragmentAddress',
               args: [BigInt(tid), BigInt(i)],
-            });
-            eventMap.set(i, {
-              fragmentAddress: fragmentAddr as string,
-              appenderAddress: '',
-              blockNumber: 0n,
-            });
-          } catch {
-            // Best-effort fallback
-          }
-        }
-      }
-
-      if (loadIdRef.current !== loadId) return;
-
-      // Load first batch in parallel
-      const firstBatchSize = Math.min(INITIAL_BATCH_SIZE, total);
-      let batchHasError = false;
-      const firstBatchPromises = Array.from({ length: firstBatchSize }, (_, i) =>
-        readContract(wagmiConfig, {
-          address: addr,
-          abi: SOULBLOCKS_ABI,
-          functionName: 'getFragmentContent',
-          args: [BigInt(tid), BigInt(i)],
-        }).then((content) => {
-          const meta = eventMap.get(i);
-          return {
-            content: decodeFragmentContent(content as `0x${string}`),
-            index: i,
-            fragmentAddress: meta?.fragmentAddress,
-            appenderAddress: meta?.appenderAddress || undefined,
-            blockNumber: meta?.blockNumber,
-            isFallbackMetadata: eventsFailed,
-          } as FragmentData;
-        })
-      );
-
-      const firstBatch = await Promise.all(firstBatchPromises);
-      if (loadIdRef.current !== loadId) return;
-
-      setFragments(firstBatch);
-
-      if (firstBatchSize >= total) {
-        fragmentCache.set(tid, { fragments: firstBatch, totalCount: total });
-        setIsAllLoaded(true);
-        setIsLoading(false);
-        return;
-      }
-
-      // Load remaining fragments sequentially
-      const allFragments = [...firstBatch];
-      for (let i = firstBatchSize; i < total; i++) {
-        if (loadIdRef.current !== loadId) return;
-
-        try {
-          const content = await readContract(wagmiConfig, {
-            address: addr,
-            abi: SOULBLOCKS_ABI,
-            functionName: 'getFragmentContent',
-            args: [BigInt(tid), BigInt(i)],
-          });
+            }),
+          ]);
 
           if (loadIdRef.current !== loadId) return;
 
-          const meta = eventMap.get(i);
           const fragment: FragmentData = {
             content: decodeFragmentContent(content as `0x${string}`),
             index: i,
-            fragmentAddress: meta?.fragmentAddress,
-            appenderAddress: meta?.appenderAddress || undefined,
-            blockNumber: meta?.blockNumber,
-            isFallbackMetadata: eventsFailed,
+            fragmentAddress: fragmentAddr as string,
+            appenderAddress: undefined,
+            blockNumber: undefined,
+            isFallbackMetadata: true,
           };
 
           allFragments.push(fragment);
-          setFragments((prev) => [...prev, fragment]);
+          setFragments([...allFragments]);
         } catch (err) {
           batchHasError = true;
           setHasLoadError(true);
@@ -310,6 +215,69 @@ export function useFragments(tokenId: number, refetchKey?: number): FragmentsRes
         setIsAllLoaded(true);
       }
       setIsLoading(false);
+
+      // Lazy-load event metadata (appender addresses + block numbers) in background
+      // This enriches the already-displayed fragments without blocking the UI.
+      if (!batchHasError && allFragments.length > 0) {
+        try {
+          const events = await getContractEvents(wagmiConfig, {
+            address: addr,
+            abi: SOULBLOCKS_ABI,
+            eventName: 'FragmentAppended',
+            args: { tokenId: BigInt(tid) },
+            fromBlock: 'earliest',
+            toBlock: 'latest',
+          });
+
+          if (loadIdRef.current !== loadId) return;
+
+          const publicClient = getPublicClient(wagmiConfig);
+          const enriched = [...allFragments];
+          let changed = false;
+
+          for (const event of events) {
+            const args = event.args as {
+              tokenId?: bigint;
+              fragment?: string;
+              byteLength?: bigint;
+              fragmentIndex?: bigint;
+            };
+            if (args.fragmentIndex !== undefined) {
+              const idx = Number(args.fragmentIndex);
+              const frag = enriched[idx];
+              if (frag) {
+                let appenderAddress = '';
+                let resolvedBlockNumber = event.blockNumber ?? 0n;
+                if (publicClient && event.transactionHash) {
+                  try {
+                    const tx = await publicClient.getTransaction({ hash: event.transactionHash });
+                    appenderAddress = tx.from;
+                    if (resolvedBlockNumber === 0n && tx.blockNumber) {
+                      resolvedBlockNumber = tx.blockNumber;
+                    }
+                  } catch {
+                    // best-effort
+                  }
+                }
+                enriched[idx] = {
+                  ...frag,
+                  appenderAddress: appenderAddress || undefined,
+                  blockNumber: resolvedBlockNumber,
+                  isFallbackMetadata: false,
+                };
+                changed = true;
+              }
+            }
+          }
+
+          if (changed && loadIdRef.current === loadId) {
+            setFragments([...enriched]);
+            fragmentCache.set(tid, { fragments: enriched, totalCount: total });
+          }
+        } catch {
+          // Event enrichment is best-effort — fragments already loaded
+        }
+      }
     } catch (err) {
       if (loadIdRef.current !== loadId) return;
       setHasLoadError(true);
